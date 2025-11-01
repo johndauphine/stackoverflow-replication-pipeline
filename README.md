@@ -1,3 +1,4 @@
+<!-- Git commit message: Remove advisory lock tasks and enforce shared default retries -->
 # Pagila End-to-End Replication Pipeline Using Astro + Apache Airflow
 ## 1. Introduction
 This document provides a complete, production-quality guide to building an end-to-end data replication pipeline using Postgres (source + target), Astronomer (Astro CLI), Apache Airflow 3, and Python-based ETL using COPY streaming. It includes fully working DAGs with idempotency, schema reset, partition-safe replication, advisory locks, and simple auditing.
@@ -591,3 +592,17 @@ For a quick smoke test, counts on target should match source. The audit query co
 ├── requirements.txt
 └── .env   (optional for AIRFLOW_CONN_... variables)
 ```
+
+---
+
+## 12. DAG Concurrency & Retries
+- Both `load_pagila_to_postgres` and `replicate_pagila_to_target` now share a `default_args` block that enforces at least two retries with a one-minute backoff. This keeps the DAGs compliant with the pytest guardrails in `tests/dags/test_dag_example.py`.
+- Advisory locks were removed from the loader DAG. If you need multi-run serialization in the future, rely on Airflow’s built-in `max_active_runs=1` or reintroduce a session-scoped lock that persists across tasks.
+- When running the pipeline, avoid triggering overlapping DAG runs unless you intentionally want concurrent replays.
+
+---
+
+## 13. Contributor Notes
+- The contributor guide lives in `AGENTS.md` and expands on project structure, coding style, testing commands, and pull-request expectations.
+- Run `astro dev pytest tests/dags` (requires Docker permissions) before opening a pull request; it covers DAG imports, tags, and retry policies.
+- If you add new DAGs, mirror the shared constants pattern (`DEFAULT_ARGS`, connection IDs, table lists) so that operators remain easy to audit and tests pass without modification.

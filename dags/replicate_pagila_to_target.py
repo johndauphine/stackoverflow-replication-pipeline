@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+# Git commit message: Remove advisory lock tasks and enforce shared default retries
+
+from datetime import datetime, timedelta
 from io import BytesIO
 
 from airflow import DAG
@@ -30,6 +32,11 @@ TABLE_ORDER = [
     "rental",
     "payment",
 ]
+
+DEFAULT_ARGS = {
+    "retries": 2,
+    "retry_delay": timedelta(minutes=1),
+}
 
 
 def ensure_tgt_roles() -> None:
@@ -127,6 +134,7 @@ with DAG(
     start_date=datetime(2024, 1, 1),
     schedule=None,
     catchup=False,
+    default_args=DEFAULT_ARGS,
     tags=["pagila", "postgres", "replication"],
     template_searchpath=["/usr/local/airflow/include"],
 ) as dag:

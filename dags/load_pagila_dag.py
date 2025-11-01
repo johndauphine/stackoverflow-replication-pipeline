@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+# Git commit message: Remove advisory lock tasks and enforce shared default retries
+
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 from airflow import DAG
@@ -17,6 +19,10 @@ AUDIT_TABLE = "pagila_support.pagila_load_audit"
 
 # Toggle this off if your schema/data do not contain 'OWNER TO postgres'.
 ENSURE_POSTGRES_ROLE = True
+DEFAULT_ARGS = {
+    "retries": 2,
+    "retry_delay": timedelta(minutes=1),
+}
 
 
 def file_sha256(path: str) -> str:
@@ -73,21 +79,6 @@ def should_reload(**context) -> bool:
             return False
     print("Idempotence: inputs not seen before (or last load failed). Will reload.")
     return True
-
-
-def acquire_lock() -> None:
-    hook = PostgresHook(postgres_conn_id=CONN_ID)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT pg_try_advisory_lock(863440123987650321);")
-        (locked,) = cur.fetchone()
-        if not locked:
-            raise RuntimeError("Could not obtain advisory lock; another run holds it.")
-
-
-def release_lock() -> None:
-    hook = PostgresHook(postgres_conn_id=CONN_ID)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT pg_advisory_unlock_all();")
 
 
 def load_pagila_copy_blocks() -> None:
@@ -170,6 +161,7 @@ with DAG(
     start_date=datetime(2024, 1, 1),
     schedule=None,
     catchup=False,
+    default_args=DEFAULT_ARGS,
     template_searchpath=["/usr/local/airflow/include"],
     tags=["pagila", "postgres", "idempotent"],
 ) as dag:
@@ -181,11 +173,6 @@ with DAG(
     short_circuit = ShortCircuitOperator(
         task_id="skip_if_already_loaded",
         python_callable=should_reload,
-    )
-
-    lock = PythonOperator(
-        task_id="acquire_lock",
-        python_callable=acquire_lock,
     )
 
     reset_public_schema = SQLExecuteQueryOperator(
@@ -244,17 +231,10 @@ with DAG(
         python_callable=record_success,
     )
 
-    unlock = PythonOperator(
-        task_id="release_lock",
-        trigger_rule="all_done",
-        python_callable=release_lock,
-    )
-
     compute_hashes >> short_circuit
-    short_circuit >> lock
-    lock >> reset_public_schema
+    short_circuit >> reset_public_schema
     if ENSURE_POSTGRES_ROLE:
         reset_public_schema >> ensure_role >> create_schema
     else:
         reset_public_schema >> create_schema
-    create_schema >> load_data >> verify_counts >> write_audit >> unlock
+    create_schema >> load_data >> verify_counts >> write_audit
