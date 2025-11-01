@@ -18,9 +18,7 @@ Then rebuild/restart your Astro environment:
 ```bash
 astro dev restart
 ```
-
----
-
+ 
 ## 3. Start Source and Target Postgres Containers (no Docker Compose)
 Start **source** on host port **5433**:
 ```bash
@@ -51,38 +49,30 @@ docker network connect <astro_airflow_network> pagila-pg-source
 docker network connect <astro_airflow_network> pagila-pg-target
 ```
 
-> To discover the exact network name run `docker network ls` after `astro dev start`.
-
----
+> To discover the exact network name run `astro dev start`, then `docker network ls | grep astro`. If you prefer `docker compose`, you can wrap these two services in a compose file as long as it joins the same Astro network.
 
 ## 4. Create Airflow Connections
-You can use `astro dev run connections ...` (note: with some Astro versions the `airflow` keyword is implicit).
+Use Airflow connections that point at the container hostnames on port 5432:
 
-**Source connection (resolves via Docker network name):**
 ```bash
 astro dev run connections add pagila_postgres \
   --conn-type postgres \
-    --conn-host pagila-pg-source \
-    --conn-port 5432 \
+  --conn-host pagila-pg-source \
+  --conn-port 5432 \
   --conn-login pagila \
   --conn-password pagila_pw \
   --conn-schema pagila
-```
 
-**Target connection:**
-```bash
 astro dev run connections add pagila_tgt \
   --conn-type postgres \
-    --conn-host pagila-pg-target \
-    --conn-port 5432 \
+  --conn-host pagila-pg-target \
+  --conn-port 5432 \
   --conn-login pagila_tgt \
   --conn-password pagila_tgt_pw \
   --conn-schema pagila
 ```
 
 > On Docker Desktop you can still point at the mapped host ports by swapping `--conn-host` for `host.docker.internal` and using ports `5433`/`5444`.
-
----
 
 ## 5. Place SQL Files
 Place the Pagila SQL files in your Astro project at:
@@ -99,16 +89,16 @@ curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-s
 curl -fsSL https://raw.githubusercontent.com/devrimgunduz/pagila/master/pagila-data.sql -o include/pagila/data.sql
 ```
 
----
-
 ## 6. Full DAG: Idempotent Pagila Loader (Source)
 
 **File:** `dags/load_pagila_dag.py`
 
 ```python
 from __future__ import annotations
-from datetime import datetime
+
 import hashlib
+from datetime import datetime
+from io import BytesIO
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
@@ -117,10 +107,13 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 CONN_ID = "pagila_postgres"
 SCHEMA_SQL_PATH = "/usr/local/airflow/include/pagila/schema.sql"
-DATA_SQL_PATH   = "/usr/local/airflow/include/pagila/data.sql"
+DATA_SQL_PATH = "/usr/local/airflow/include/pagila/data.sql"
+AUDIT_SCHEMA = "pagila_support"
+AUDIT_TABLE = "pagila_support.pagila_load_audit"
 
-# Toggle this off if your schema/data do NOT contain 'OWNER TO postgres'
+# Toggle this off if your schema/data do not contain 'OWNER TO postgres'.
 ENSURE_POSTGRES_ROLE = True
+
 
 def file_sha256(path: str) -> str:
     h = hashlib.sha256()
@@ -129,22 +122,25 @@ def file_sha256(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def compute_input_fingerprints(**context) -> None:
     schema_hash = file_sha256(SCHEMA_SQL_PATH)
-    data_hash   = file_sha256(DATA_SQL_PATH)
+    data_hash = file_sha256(DATA_SQL_PATH)
     ti = context["ti"]
     ti.xcom_push(key="schema_hash", value=schema_hash)
-    ti.xcom_push(key="data_hash",   value=data_hash)
+    ti.xcom_push(key="data_hash", value=data_hash)
+
 
 def should_reload(**context) -> bool:
     ti = context["ti"]
     schema_hash = ti.xcom_pull(key="schema_hash", task_ids="compute_hashes")
-    data_hash   = ti.xcom_pull(key="data_hash",   task_ids="compute_hashes")
+    data_hash = ti.xcom_pull(key="data_hash", task_ids="compute_hashes")
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {AUDIT_SCHEMA};")
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pagila_load_audit (
+            f"""
+            CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
               id                bigserial PRIMARY KEY,
               loaded_at         timestamptz NOT NULL DEFAULT now(),
               schema_sha256     text NOT NULL,
@@ -158,9 +154,9 @@ def should_reload(**context) -> bool:
             """
         )
         cur.execute(
-            """
+            f"""
             SELECT succeeded
-            FROM pagila_load_audit
+            FROM {AUDIT_TABLE}
             WHERE schema_sha256=%s AND data_sha256=%s
             ORDER BY loaded_at DESC
             LIMIT 1;
@@ -174,21 +170,23 @@ def should_reload(**context) -> bool:
     print("Idempotence: inputs not seen before (or last load failed). Will reload.")
     return True
 
+
 def acquire_lock() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT pg_try_advisory_lock(863440123987650321);")
-        locked, = cur.fetchone()
+        (locked,) = cur.fetchone()
         if not locked:
             raise RuntimeError("Could not obtain advisory lock; another run holds it.")
+
 
 def release_lock() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_unlock_all();")
 
+
 def load_pagila_copy_blocks() -> None:
-    import io
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     conn = hook.get_conn()
     conn.autocommit = True
@@ -207,9 +205,8 @@ def load_pagila_copy_blocks() -> None:
                         in_copy = True
                         buf.clear()
                 else:
-                    if line.strip() == "\.":
-                        import io as _io
-                        with _io.BytesIO(bytes(buf)) as fp:
+                    if line.strip() == "\\.":
+                        with BytesIO(bytes(buf)) as fp:
                             cur.copy_expert(copy_sql, fp)
                         in_copy = False
                         buf.clear()
@@ -223,24 +220,46 @@ def load_pagila_copy_blocks() -> None:
     cur.close()
     conn.close()
 
+
 def record_success(**context) -> None:
     ti = context["ti"]
     schema_hash = ti.xcom_pull(key="schema_hash", task_ids="compute_hashes")
-    data_hash   = ti.xcom_pull(key="data_hash",   task_ids="compute_hashes")
+    data_hash = ti.xcom_pull(key="data_hash", task_ids="compute_hashes")
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM actor;");    actor = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM film;");     film  = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM customer;"); cust  = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM rental;");   rent  = cur.fetchone()[0]
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {AUDIT_SCHEMA};")
         cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
+              id                bigserial PRIMARY KEY,
+              loaded_at         timestamptz NOT NULL DEFAULT now(),
+              schema_sha256     text NOT NULL,
+              data_sha256       text NOT NULL,
+              actor_count       bigint,
+              film_count        bigint,
+              customer_count    bigint,
+              rental_count      bigint,
+              succeeded         boolean NOT NULL
+            );
             """
-            INSERT INTO pagila_load_audit
-              (schema_sha256, data_sha256, actor_count, film_count, customer_count, rental_count, succeeded)
-            VALUES (%s,%s,%s,%s,%s,%s, TRUE);
-            """
-            , (schema_hash, data_hash, actor, film, cust, rent)
         )
+        cur.execute("SELECT COUNT(*) FROM actor;")
+        actor = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM film;")
+        film = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM customer;")
+        cust = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM rental;")
+        rent = cur.fetchone()[0]
+        cur.execute(
+            f"""
+            INSERT INTO {AUDIT_TABLE}
+              (schema_sha256, data_sha256, actor_count, film_count, customer_count, rental_count, succeeded)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE);
+            """,
+            (schema_hash, data_hash, actor, film, cust, rent),
+        )
+
 
 with DAG(
     dag_id="load_pagila_to_postgres",
@@ -250,7 +269,6 @@ with DAG(
     template_searchpath=["/usr/local/airflow/include"],
     tags=["pagila", "postgres", "idempotent"],
 ) as dag:
-
     compute_hashes = PythonOperator(
         task_id="compute_hashes",
         python_callable=compute_input_fingerprints,
@@ -338,6 +356,9 @@ with DAG(
     create_schema >> load_data >> verify_counts >> write_audit >> unlock
 ```
 
+> Audit history lives in `pagila_support.pagila_load_audit`, which is left untouched even when the DAG drops and recreates the `public` schema.
+```
+
 ---
 
 ## 7. Full DAG: Pagila Replication (Source → Target)
@@ -348,19 +369,18 @@ with DAG(
 from __future__ import annotations
 
 from datetime import datetime
+from io import BytesIO
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-# Use your actual source connection id here if different
 SRC_CONN_ID = "pagila_postgres"
 TGT_CONN_ID = "pagila_tgt"
 
-SCHEMA_SQL_PATH = "/usr/local/airflow/include/pagila/schema.sql"
 ENSURE_POSTGRES_ROLE_ON_TARGET = True
 
-# FK-safe order for Pagila
 TABLE_ORDER = [
     "language",
     "category",
@@ -379,22 +399,27 @@ TABLE_ORDER = [
     "payment",
 ]
 
-def ensure_tgt_roles():
+
+def ensure_tgt_roles() -> None:
     hook = PostgresHook(postgres_conn_id=TGT_CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(
+            """
         DO $$
         BEGIN
           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='postgres') THEN
             CREATE ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'postgres_pw';
           END IF;
         END$$;
-        """)
+        """
+        )
 
-def reset_target_schema():
+
+def reset_target_schema() -> None:
     hook = PostgresHook(postgres_conn_id=TGT_CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(
+            """
         DO $$
         BEGIN
           IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name='public') THEN
@@ -403,14 +428,12 @@ def reset_target_schema():
           EXECUTE 'CREATE SCHEMA public AUTHORIZATION current_user';
           PERFORM set_config('search_path', 'public', true);
         END$$;
-        """)
+        """
+        )
 
-def copy_table_src_to_tgt(table: str):
-    """Robust copy for partitioned and non-partitioned tables.
-    COPY (SELECT * FROM public.table) TO STDOUT on source; COPY public.table FROM STDIN on target.
-    Assumes identical schemas (target created from schema.sql).
-    """
-    import io
+
+def copy_table_src_to_tgt(table: str) -> None:
+    """Safely copy a table from source to target using COPY streaming."""
     src = PostgresHook(postgres_conn_id=SRC_CONN_ID)
     tgt = PostgresHook(postgres_conn_id=TGT_CONN_ID)
     with src.get_conn() as src_conn, tgt.get_conn() as tgt_conn:
@@ -419,21 +442,23 @@ def copy_table_src_to_tgt(table: str):
         s_cur = src_conn.cursor()
         t_cur = tgt_conn.cursor()
 
-        # Ensure target table exists
         t_cur.execute(
             """
             SELECT 1
             FROM information_schema.tables
             WHERE table_schema='public' AND table_name=%s
-            """, (table,),
+            """,
+            (table,),
         )
         if t_cur.fetchone() is None:
-            raise RuntimeError(f"Target table public.{table} does not exist; did schema.sql run?")
+            raise RuntimeError(
+                f"Target table public.{table} does not exist; did schema.sql run?"
+            )
 
         copy_out_query = f"COPY (SELECT * FROM public.{table}) TO STDOUT"
-        copy_in_cmd    = f"COPY public.{table} FROM STDIN"
+        copy_in_cmd = f"COPY public.{table} FROM STDIN"
 
-        buf = io.BytesIO()
+        buf = BytesIO()
         s_cur.copy_expert(copy_out_query, buf)
         buf.seek(0)
         t_cur.copy_expert(copy_in_cmd, buf)
@@ -441,7 +466,8 @@ def copy_table_src_to_tgt(table: str):
         s_cur.close()
         t_cur.close()
 
-def set_identity_sequences():
+
+def set_identity_sequences() -> None:
     tgt = PostgresHook(postgres_conn_id=TGT_CONN_ID)
     with tgt.get_conn() as conn, conn.cursor() as cur:
         seq_fix_sql = [
@@ -463,6 +489,7 @@ def set_identity_sequences():
             (max_id,) = cur.fetchone()
             cur.execute("SELECT setval(%s, %s, %s);", (seq, max_id, True))
 
+
 with DAG(
     dag_id="replicate_pagila_to_target",
     start_date=datetime(2024, 1, 1),
@@ -471,7 +498,6 @@ with DAG(
     tags=["pagila", "postgres", "replication"],
     template_searchpath=["/usr/local/airflow/include"],
 ) as dag:
-
     reset_tgt = PythonOperator(
         task_id="reset_target_schema",
         python_callable=reset_target_schema,
@@ -488,7 +514,6 @@ with DAG(
         sql="pagila/schema.sql",
     )
 
-    copy_tasks = []
     prev = create_target_schema
     for tbl in TABLE_ORDER:
         t = PythonOperator(
@@ -496,7 +521,6 @@ with DAG(
             python_callable=copy_table_src_to_tgt,
             op_kwargs={"table": tbl},
         )
-        copy_tasks.append(t)
         prev >> t
         prev = t
 
@@ -537,8 +561,11 @@ astro dev run dags trigger replicate_pagila_to_target
 # Row counts on target (examples)
 docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*) FROM actor;"
 docker exec -it pagila-pg-target psql -U pagila_tgt -d pagila -c "SELECT COUNT(*) FROM rental;"
+
+# Audit ledger on source
+docker exec -it pagila-pg-source psql -U pagila -d pagila -c "SELECT loaded_at, schema_sha256, data_sha256, succeeded FROM pagila_support.pagila_load_audit ORDER BY loaded_at DESC LIMIT 5;"
 ```
-For a quick smoke test, counts on target should match source.
+For a quick smoke test, counts on target should match source. The audit query confirms the loader recognized your latest schema + data hashes.
 
 ---
 

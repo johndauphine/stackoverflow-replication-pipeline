@@ -12,6 +12,8 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 CONN_ID = "pagila_postgres"
 SCHEMA_SQL_PATH = "/usr/local/airflow/include/pagila/schema.sql"
 DATA_SQL_PATH = "/usr/local/airflow/include/pagila/data.sql"
+AUDIT_SCHEMA = "pagila_support"
+AUDIT_TABLE = "pagila_support.pagila_load_audit"
 
 # Toggle this off if your schema/data do not contain 'OWNER TO postgres'.
 ENSURE_POSTGRES_ROLE = True
@@ -39,9 +41,10 @@ def should_reload(**context) -> bool:
     data_hash = ti.xcom_pull(key="data_hash", task_ids="compute_hashes")
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {AUDIT_SCHEMA};")
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pagila_load_audit (
+            f"""
+            CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
               id                bigserial PRIMARY KEY,
               loaded_at         timestamptz NOT NULL DEFAULT now(),
               schema_sha256     text NOT NULL,
@@ -55,9 +58,9 @@ def should_reload(**context) -> bool:
             """
         )
         cur.execute(
-            """
+            f"""
             SELECT succeeded
-            FROM pagila_load_audit
+            FROM {AUDIT_TABLE}
             WHERE schema_sha256=%s AND data_sha256=%s
             ORDER BY loaded_at DESC
             LIMIT 1;
@@ -128,6 +131,22 @@ def record_success(**context) -> None:
     data_hash = ti.xcom_pull(key="data_hash", task_ids="compute_hashes")
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     with hook.get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {AUDIT_SCHEMA};")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
+              id                bigserial PRIMARY KEY,
+              loaded_at         timestamptz NOT NULL DEFAULT now(),
+              schema_sha256     text NOT NULL,
+              data_sha256       text NOT NULL,
+              actor_count       bigint,
+              film_count        bigint,
+              customer_count    bigint,
+              rental_count      bigint,
+              succeeded         boolean NOT NULL
+            );
+            """
+        )
         cur.execute("SELECT COUNT(*) FROM actor;")
         actor = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM film;")
@@ -137,8 +156,8 @@ def record_success(**context) -> None:
         cur.execute("SELECT COUNT(*) FROM rental;")
         rent = cur.fetchone()[0]
         cur.execute(
-            """
-            INSERT INTO pagila_load_audit
+            f"""
+            INSERT INTO {AUDIT_TABLE}
               (schema_sha256, data_sha256, actor_count, film_count, customer_count, rental_count, succeeded)
             VALUES (%s, %s, %s, %s, %s, %s, TRUE);
             """,
