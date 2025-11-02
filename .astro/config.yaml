@@ -1,2 +1,32 @@
 project:
     name: pagila-demo-project
+
+# Local environment resource allocation for warehouse-scale streaming
+local:
+  scheduler:
+    resources:
+      limits:
+        memory: 2Gi
+      requests:
+        memory: 1Gi
+  
+  webserver:
+    resources:
+      limits:
+        memory: 1Gi
+      requests:
+        memory: 512Mi
+  
+  triggerer:
+    resources:
+      limits:
+        memory: 512Mi
+      requests:
+        memory: 256Mi
+  
+  postgres:
+    resources:
+      limits:
+        memory: 512Mi
+      requests:
+        memory: 256Mi

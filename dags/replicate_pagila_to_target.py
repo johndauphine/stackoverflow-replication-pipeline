@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-# Git commit message: Remove advisory lock tasks and enforce shared default retries
-
+import logging
 from datetime import datetime, timedelta
-from io import BytesIO
+from tempfile import SpooledTemporaryFile
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -14,6 +13,11 @@ SRC_CONN_ID = "pagila_postgres"
 TGT_CONN_ID = "pagila_tgt"
 
 ENSURE_POSTGRES_ROLE_ON_TARGET = True
+
+# Disk-backed streaming configuration (SpooledTemporaryFile)
+SPOOLED_MAX_MEMORY_BYTES = 128 * 1024 * 1024  # spill to disk above ~128 MB
+
+log = logging.getLogger(__name__)
 
 TABLE_ORDER = [
     "language",
@@ -72,38 +76,57 @@ def reset_target_schema() -> None:
 
 
 def copy_table_src_to_tgt(table: str) -> None:
-    """Safely copy a table from source to target using COPY streaming."""
-    src = PostgresHook(postgres_conn_id=SRC_CONN_ID)
-    tgt = PostgresHook(postgres_conn_id=TGT_CONN_ID)
-    with src.get_conn() as src_conn, tgt.get_conn() as tgt_conn:
-        src_conn.autocommit = True
-        tgt_conn.autocommit = True
-        s_cur = src_conn.cursor()
-        t_cur = tgt_conn.cursor()
+    """Copy a table via SpooledTemporaryFile to cap disk usage on the worker."""
 
-        t_cur.execute(
-            """
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema='public' AND table_name=%s
-            """,
-            (table,),
+    src_hook = PostgresHook(postgres_conn_id=SRC_CONN_ID)
+    tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID)
+
+    log.info(
+        "[%s] starting buffered copy (memory cap≈%.1f MB)",
+        table,
+        SPOOLED_MAX_MEMORY_BYTES / (1024 * 1024),
+    )
+
+    with SpooledTemporaryFile(max_size=SPOOLED_MAX_MEMORY_BYTES, mode="w+b") as spool:
+        with src_hook.get_conn() as src_conn:
+            src_conn.autocommit = True
+            with src_conn.cursor() as src_cur:
+                copy_sql = f"COPY (SELECT * FROM public.{table}) TO STDOUT"
+                src_cur.copy_expert(copy_sql, spool)
+
+        spool.flush()
+
+        written_bytes = spool.tell()
+        spilled_to_disk = bool(getattr(spool, "_rolled", False))
+        log.info(
+            "[%s] buffered %s bytes (rolled_to_disk=%s)",
+            table,
+            written_bytes,
+            spilled_to_disk,
         )
-        if t_cur.fetchone() is None:
-            raise RuntimeError(
-                f"Target table public.{table} does not exist; did schema.sql run?"
-            )
 
-        copy_out_query = f"COPY (SELECT * FROM public.{table}) TO STDOUT"
-        copy_in_cmd = f"COPY public.{table} FROM STDIN"
+        spool.seek(0)
 
-        buf = BytesIO()
-        s_cur.copy_expert(copy_out_query, buf)
-        buf.seek(0)
-        t_cur.copy_expert(copy_in_cmd, buf)
+        with tgt_hook.get_conn() as tgt_conn:
+            tgt_conn.autocommit = True
+            with tgt_conn.cursor() as tgt_cur:
+                tgt_cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema='public' AND table_name=%s
+                    """,
+                    (table,),
+                )
+                if tgt_cur.fetchone() is None:
+                    raise RuntimeError(
+                        f"Target table public.{table} does not exist; did schema.sql run?"
+                    )
 
-        s_cur.close()
-        t_cur.close()
+                copy_in_cmd = f"COPY public.{table} FROM STDIN"
+                tgt_cur.copy_expert(copy_in_cmd, spool)
+
+    log.info("[%s] copy completed (bytes=%s)", table, written_bytes)
 
 
 def set_identity_sequences() -> None:
