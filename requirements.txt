@@ -3,5 +3,5 @@
 apache-airflow-providers-postgres
 apache-airflow-providers-microsoft-mssql
 apache-airflow-providers-common-sql
-psycopg2-binary
+pg8000>=1.29.0  # Pure Python PostgreSQL driver (fork-safe for LocalExecutor)
 pymssql

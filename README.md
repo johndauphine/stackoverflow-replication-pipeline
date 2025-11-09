@@ -2,14 +2,16 @@
 
 ## 1. Introduction
 
-This project provides a complete, production-quality SQL Server-to-SQL Server data replication pipeline using Brent Ozar's StackOverflow2010 database, Astronomer (Astro CLI), Apache Airflow 3, and memory-efficient streaming ETL. It demonstrates enterprise-grade data engineering practices including:
+This project provides complete, production-quality data replication pipelines using Brent Ozar's StackOverflow2010 database, Astronomer (Astro CLI), Apache Airflow 3, and memory-efficient streaming ETL. It demonstrates enterprise-grade data engineering practices including:
 
 - **Memory-capped streaming replication** (128MB buffer)
 - **SQL Server-to-SQL Server** replication using pymssql
+- **SQL Server-to-PostgreSQL** cross-database replication with automatic type mapping
 - **Large-scale dataset handling** (8.4GB database, ~12 million rows across 9 tables)
 - **Identity sequence alignment** after data copy
 - **Dependency-aware table ordering** to maintain referential integrity
 - **Production-ready error handling** with configurable retries
+- **Fork-safe database drivers** (pg8000 for PostgreSQL on LocalExecutor)
 
 **Database Source:** Brent Ozar's StackOverflow2010 (2008-2010 data)
 - Users: ~315K
@@ -33,8 +35,10 @@ This project provides a complete, production-quality SQL Server-to-SQL Server da
 
 Add these to your Astro project's `requirements.txt`:
 - `apache-airflow-providers-microsoft-mssql`
+- `apache-airflow-providers-postgres`
 - `apache-airflow-providers-common-sql`
-- `pymssql`
+- `pymssql` (SQL Server driver)
+- `pg8000>=1.29.0` (PostgreSQL driver - pure Python, fork-safe for LocalExecutor)
 
 Then rebuild/restart your Astro environment:
 
@@ -273,11 +277,112 @@ docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ---
 
-## 9. Architecture Overview
+## 9. Alternative Setup: SQL Server to PostgreSQL Replication
 
-### 9.1 DAG Structure
+This setup replicates data from SQL Server to PostgreSQL, providing cross-platform compatibility and cost benefits.
 
-**File**: `dags/replicate_stackoverflow_to_target.py`
+### 9.1 Benefits
+
+- **Cross-platform compatibility**: PostgreSQL runs natively on ARM64 (Apple Silicon), AMD64, and all major operating systems
+- **No licensing costs**: PostgreSQL is open source
+- **Better performance** for analytical workloads and data warehousing
+- **Production-ready**: Uses fork-safe pg8000 driver for LocalExecutor compatibility
+
+### 9.2 Setup PostgreSQL Target
+
+```bash
+# Start PostgreSQL 16 target container
+docker run -d \
+  --name stackoverflow-postgres-target \
+  -e "POSTGRES_PASSWORD=StackOverflow123!" \
+  -e "POSTGRES_USER=postgres" \
+  -e "POSTGRES_DB=stackoverflow_target" \
+  -p 5432:5432 \
+  postgres:16
+
+# Connect to Astro network
+ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'stackoverflow.*_airflow')
+docker network connect $ASTRO_NETWORK stackoverflow-postgres-target
+```
+
+### 9.3 Create PostgreSQL Connection
+
+```bash
+astro dev run connections add stackoverflow_postgres_target \
+  --conn-type postgres \
+  --conn-host stackoverflow-postgres-target \
+  --conn-port 5432 \
+  --conn-login postgres \
+  --conn-password "StackOverflow123!" \
+  --conn-schema stackoverflow_target
+```
+
+### 9.4 Run PostgreSQL Replication DAG
+
+```bash
+# Enable and trigger the PostgreSQL DAG
+astro dev run dags unpause replicate_stackoverflow_to_postgres
+astro dev run dags trigger replicate_stackoverflow_to_postgres
+```
+
+### 9.5 Verify PostgreSQL Replication
+
+```bash
+# Check row counts in PostgreSQL
+docker exec stackoverflow-postgres-target psql -U postgres -d stackoverflow_target -c \
+  "SELECT 'Users' AS table_name, COUNT(*) AS row_count FROM \"Users\"
+   UNION ALL SELECT 'Posts', COUNT(*) FROM \"Posts\"
+   UNION ALL SELECT 'Comments', COUNT(*) FROM \"Comments\"
+   UNION ALL SELECT 'Votes', COUNT(*) FROM \"Votes\"
+   UNION ALL SELECT 'Badges', COUNT(*) FROM \"Badges\"
+   ORDER BY table_name;"
+```
+
+### 9.6 PostgreSQL-Specific Features
+
+**Data Type Mapping:**
+| SQL Server | PostgreSQL |
+|-----------|-----------|
+| NVARCHAR(MAX) | TEXT |
+| NVARCHAR(n) | VARCHAR(n) |
+| DATETIME | TIMESTAMP |
+| BIT | BOOLEAN |
+| INT | INTEGER |
+| BIGINT | BIGINT |
+| IDENTITY(1,1) | GENERATED ALWAYS AS IDENTITY |
+
+**Key Differences:**
+- Uses PostgreSQL **COPY** command for faster bulk loading
+- Automatic data type conversion
+- Case-sensitive table/column names (quoted identifiers: `"Users"` not `users`)
+- Uses **pg8000** driver (pure Python, fork-safe for Airflow LocalExecutor)
+- No need for `SET IDENTITY_INSERT` equivalent
+- Sequence management with **setval()** instead of **DBCC CHECKIDENT**
+
+### 9.7 Troubleshooting PostgreSQL DAG
+
+**Issue:** Tasks fail with `SIGKILL: -9` error
+
+**Cause:** Using psycopg2 (C extension) with LocalExecutor causes fork deadlocks
+
+**Solution:** Ensure pg8000 is installed:
+```bash
+# Check requirements.txt includes:
+pg8000>=1.29.0
+
+# Restart Airflow
+astro dev restart
+```
+
+PostgresHook will automatically use pg8000 when available, avoiding fork issues.
+
+---
+
+## 10. Architecture Overview
+
+### 10.1 DAG Structure
+
+**File**: `dags/replicate_stackoverflow_to_target.py` (SQL Server → SQL Server)
 
 **Key Features**:
 - Memory-capped streaming (128MB buffer)
@@ -287,7 +392,17 @@ docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhos
 - Parallel task execution (up to 16 concurrent tasks)
 - Dependency-aware table ordering
 
-### 9.2 Table Replication Order
+**File**: `dags/replicate_stackoverflow_to_postgres.py` (SQL Server → PostgreSQL)
+
+**Key Features**:
+- Cross-database data type mapping (SQL Server → PostgreSQL)
+- PostgreSQL COPY command for efficient bulk loading
+- Automatic data type conversion (NVARCHAR → VARCHAR, DATETIME → TIMESTAMP, etc.)
+- Identity column conversion (IDENTITY → GENERATED ALWAYS AS IDENTITY)
+- Sequence management with setval()
+- Fork-safe pg8000 driver for LocalExecutor compatibility
+
+### 10.2 Table Replication Order
 
 Tables are replicated in dependency order to maintain referential integrity:
 
@@ -303,7 +418,7 @@ Tables are replicated in dependency order to maintain referential integrity:
 9. Votes (depends on Posts, VoteTypes)
 ```
 
-### 9.3 Memory Management
+### 10.3 Memory Management
 
 - **SpooledTemporaryFile**: Uses 128MB in-memory buffer
 - **Disk Spillover**: Automatically writes to disk when buffer exceeds threshold
@@ -312,12 +427,13 @@ Tables are replicated in dependency order to maintain referential integrity:
 
 ---
 
-## 10. Project Structure
+## 11. Project Structure
 
 ```
 stackoverflow-demo-project/
 ├── dags/
-│   └── replicate_stackoverflow_to_target.py    # Main replication DAG
+│   ├── replicate_stackoverflow_to_target.py     # SQL Server → SQL Server DAG
+│   └── replicate_stackoverflow_to_postgres.py   # SQL Server → PostgreSQL DAG
 ├── include/
 │   └── stackoverflow/
 │       ├── StackOverflow2010.mdf               # 8.4GB database file
@@ -337,9 +453,9 @@ stackoverflow-demo-project/
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
-### 11.1 Database Connection Issues
+### 12.1 Database Connection Issues
 
 **Problem**: "Login failed for user 'sa'"
 
@@ -355,7 +471,7 @@ docker logs stackoverflow-mssql-source
 sleep 30
 ```
 
-### 11.2 Database Attach Fails
+### 12.2 Database Attach Fails
 
 **Problem**: "Unable to open the physical file" or "Operating system error 5"
 
@@ -369,7 +485,7 @@ docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.m
 docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.ldf
 ```
 
-### 11.3 Memory Issues
+### 12.3 Memory Issues
 
 **Problem**: "Out of memory" or slow performance
 
@@ -377,7 +493,7 @@ docker exec stackoverflow-mssql-source chown mssql:mssql /var/opt/mssql/data/*.l
 - Docker Desktop → Settings → Resources → Memory: 8GB+
 - Edit `.astro/config.yaml` to reduce parallelism
 
-### 11.4 DAG Import Errors
+### 12.4 DAG Import Errors
 
 **Problem**: DAG doesn't appear in Airflow UI
 
@@ -393,7 +509,7 @@ astro dev run dags list-import-errors
 astro dev restart
 ```
 
-### 11.5 Azure SQL Edge Stability Issues (IMPORTANT)
+### 12.5 Azure SQL Edge Stability Issues (IMPORTANT)
 
 **Problem**: SQL Server container crashes with `SIGABRT` or exits unexpectedly during:
 - Database initialization
@@ -480,21 +596,21 @@ docker run -d --name stackoverflow-mssql-target \
 
 ---
 
-## 12. Development and Testing
+## 13. Development and Testing
 
-### 12.1 Run DAG Tests
+### 13.1 Run DAG Tests
 
 ```bash
 astro dev run pytest tests/dags -v
 ```
 
-### 12.2 Dry-Run DAG
+### 13.2 Dry-Run DAG
 
 ```bash
 astro dev run dags test replicate_stackoverflow_to_target 2025-01-01
 ```
 
-### 12.3 View Logs
+### 13.3 View Logs
 
 ```bash
 # Scheduler logs
@@ -506,9 +622,9 @@ http://localhost:8080 → DAGs → replicate_stackoverflow_to_target → Logs
 
 ---
 
-## 13. Cleanup
+## 14. Cleanup
 
-### 13.1 Stop Containers
+### 14.1 Stop Containers
 
 ```bash
 # Stop Airflow
@@ -519,7 +635,7 @@ docker stop stackoverflow-mssql-source stackoverflow-mssql-target
 docker rm stackoverflow-mssql-source stackoverflow-mssql-target
 ```
 
-### 13.2 Remove Database Files (Optional)
+### 14.2 Remove Database Files (Optional)
 
 ```bash
 # Remove compressed archive (keep .mdf and .ldf)
@@ -531,9 +647,9 @@ rm -rf include/stackoverflow/
 
 ---
 
-## 14. License and Attribution
+## 15. License and Attribution
 
-### 14.1 Stack Overflow Database
+### 15.1 Stack Overflow Database
 
 The StackOverflow2010 database is provided under **CC-BY-SA 3.0** license:
 - **Source**: Stack Exchange Data Dump (https://archive.org/details/stackexchange)
@@ -548,13 +664,13 @@ The StackOverflow2010 database is provided under **CC-BY-SA 3.0** license:
 - Attribution — You must give appropriate credit to Stack Exchange Inc. and original authors
 - ShareAlike — If you remix or transform the material, you must distribute under the same license
 
-### 14.2 Project Code
+### 15.2 Project Code
 
 This replication pipeline project code is provided as-is for educational and production use.
 
 ---
 
-## 15. Additional Resources
+## 16. Additional Resources
 
 - **Brent Ozar's Blog**: https://www.brentozar.com/archive/category/tools/stack-overflow-database/
 - **Stack Exchange Data Dump**: https://archive.org/details/stackexchange
@@ -564,7 +680,7 @@ This replication pipeline project code is provided as-is for educational and pro
 
 ---
 
-## 16. Next Steps
+## 17. Next Steps
 
 1. **Add Incremental Loads**: Modify DAG to support CDC or timestamp-based updates
 2. **Add Data Quality Checks**: Implement Great Expectations or custom validation
