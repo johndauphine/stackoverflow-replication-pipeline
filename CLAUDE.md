@@ -23,6 +23,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
+## Network Architecture
+
+**Production-Like Design**: Database containers run on **separate networks** from Airflow, simulating real production environments where databases are external services (AWS RDS, Azure SQL, etc.).
+
+```
+┌──────────────────┐
+│  Astro Network   │          External Databases
+│  ┌────────────┐  │          (Separate Networks)
+│  │  Airflow   │  │
+│  │ Scheduler  │──┼──► HOST_IP:1433 ──► SQL Server Source
+│  └────────────┘  │   (via host network)
+│                  │
+│                  │──► HOST_IP:1434 ──► SQL Server Target
+└──────────────────┘   (via host network)
+```
+
+**Platform-Specific Host IP:**
+- **Linux** (ChromeOS, Ubuntu, etc.): `172.17.0.1` (Docker bridge gateway)
+- **macOS/Windows**: `host.docker.internal` (Docker Desktop special hostname)
+
+**Why This Design?**
+- ✓ Simulates production where databases are on separate servers/VMs
+- ✓ Tests real TCP/IP network communication (not just Docker bridge)
+- ✓ Validates firewall/port-based access control
+- ✓ Proves pipelines work with external database services
+- ✓ More secure - databases isolated from Airflow infrastructure
+
+---
+
 ## Quick Start: Complete Environment Setup
 
 ### Step 1: Start Astro
@@ -38,6 +67,7 @@ astro dev start
 # Start SQL Server 2022 source with StackOverflow2010 database
 # Note: The .mdf and .ldf files are in include/stackoverflow/
 # Requires AMD64/x86_64 architecture (SQL Server 2022 does not support ARM64)
+# Port 1433 exposed to host (NOT on Astro network - production-like design)
 docker run -d --name stackoverflow-mssql-source \
   --platform linux/amd64 \
   --memory="4g" \
@@ -47,18 +77,16 @@ docker run -d --name stackoverflow-mssql-source \
   -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
 
 # Start SQL Server 2022 target (4GB RAM for heavy write operations)
+# Port 1434 exposed to host (NOT on Astro network - production-like design)
 docker run -d --name stackoverflow-mssql-target \
   --platform linux/amd64 \
   --memory="4g" \
   -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=StackOverflow123!" \
   -e "MSSQL_PID=Developer" \
   -p 1434:1433 mcr.microsoft.com/mssql/server:2022-latest
-
-# Connect to Astro network
-ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'stackoverflow.*_airflow')
-docker network connect $ASTRO_NETWORK stackoverflow-mssql-source
-docker network connect $ASTRO_NETWORK stackoverflow-mssql-target
 ```
+
+**Note:** Databases are **NOT** connected to the Astro network. Airflow accesses them via host network, simulating external database servers.
 
 ### Step 3: Attach Source Database
 
@@ -79,15 +107,29 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ### Step 4: Create Airflow Connections
 
+**For Linux (ChromeOS, Ubuntu, etc.):**
 ```bash
-# Source connection
+# Source connection (via Docker bridge gateway)
 astro dev run connections add stackoverflow_source \
-  --conn-type mssql --conn-host stackoverflow-mssql-source --conn-port 1433 \
+  --conn-type mssql --conn-host 172.17.0.1 --conn-port 1433 \
   --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
 
-# Target connection
+# Target connection (via Docker bridge gateway)
 astro dev run connections add stackoverflow_target \
-  --conn-type mssql --conn-host stackoverflow-mssql-target --conn-port 1433 \
+  --conn-type mssql --conn-host 172.17.0.1 --conn-port 1434 \
+  --conn-login sa --conn-password "StackOverflow123!" --conn-schema master
+```
+
+**For macOS/Windows:**
+```bash
+# Source connection (via Docker Desktop host gateway)
+astro dev run connections add stackoverflow_source \
+  --conn-type mssql --conn-host host.docker.internal --conn-port 1433 \
+  --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
+
+# Target connection (via Docker Desktop host gateway)
+astro dev run connections add stackoverflow_target \
+  --conn-type mssql --conn-host host.docker.internal --conn-port 1434 \
   --conn-login sa --conn-password "StackOverflow123!" --conn-schema master
 ```
 
@@ -146,6 +188,7 @@ astro dev start
 # Start SQL Server 2022 source with StackOverflow2010 database
 # Note: On ARM64 (Apple Silicon), this runs in x86_64 emulation mode (slower, less stable)
 # Requires AMD64/x86_64 architecture OR ARM64 with emulation
+# Port 1433 exposed to host (NOT on Astro network - production-like design)
 docker run -d --name stackoverflow-mssql-source \
   --platform linux/amd64 \
   --memory="4g" \
@@ -155,17 +198,16 @@ docker run -d --name stackoverflow-mssql-source \
   -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
 
 # Start PostgreSQL 16 target (cross-platform, works on ARM64 and AMD64)
+# Port 5433 to avoid conflict with Astro's internal Postgres on 5432
+# NOT on Astro network - production-like design
 docker run -d --name stackoverflow-postgres-target \
   -e "POSTGRES_PASSWORD=StackOverflow123!" \
   -e "POSTGRES_USER=postgres" \
   -e "POSTGRES_DB=stackoverflow_target" \
-  -p 5432:5432 postgres:16
-
-# Connect to Astro network
-ASTRO_NETWORK=$(docker network ls --format '{{.Name}}' | grep 'stackoverflow.*_airflow')
-docker network connect $ASTRO_NETWORK stackoverflow-mssql-source
-docker network connect $ASTRO_NETWORK stackoverflow-postgres-target
+  -p 5433:5432 postgres:16
 ```
+
+**Note:** Databases are **NOT** connected to the Astro network. Airflow accesses them via host network, simulating external database services like AWS RDS or Azure Database for PostgreSQL.
 
 ### Step 3: Attach Source Database
 
@@ -186,15 +228,29 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ### Step 4: Create Airflow Connections
 
+**For Linux (ChromeOS, Ubuntu, etc.):**
 ```bash
-# Source connection (SQL Server)
+# Source connection - SQL Server (via Docker bridge gateway)
 astro dev run connections add stackoverflow_source \
-  --conn-type mssql --conn-host stackoverflow-mssql-source --conn-port 1433 \
+  --conn-type mssql --conn-host 172.17.0.1 --conn-port 1433 \
   --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
 
-# Target connection (PostgreSQL)
+# Target connection - PostgreSQL (via Docker bridge gateway)
 astro dev run connections add stackoverflow_postgres_target \
-  --conn-type postgres --conn-host stackoverflow-postgres-target --conn-port 5432 \
+  --conn-type postgres --conn-host 172.17.0.1 --conn-port 5433 \
+  --conn-login postgres --conn-password "StackOverflow123!" --conn-schema stackoverflow_target
+```
+
+**For macOS/Windows:**
+```bash
+# Source connection - SQL Server (via Docker Desktop host gateway)
+astro dev run connections add stackoverflow_source \
+  --conn-type mssql --conn-host host.docker.internal --conn-port 1433 \
+  --conn-login sa --conn-password "StackOverflow123!" --conn-schema StackOverflow2010
+
+# Target connection - PostgreSQL (via Docker Desktop host gateway)
+astro dev run connections add stackoverflow_postgres_target \
+  --conn-type postgres --conn-host host.docker.internal --conn-port 5433 \
   --conn-login postgres --conn-password "StackOverflow123!" --conn-schema stackoverflow_target
 ```
 
@@ -242,11 +298,12 @@ This is a **Stack Overflow End-to-End Data Replication Pipeline** using Apache A
 
 **Key Components:**
 - Source SQL Server database (port 1433) with StackOverflow2010 sample data (Brent Ozar edition)
-- Target databases: SQL Server (port 1434) or PostgreSQL (port 5432)
+- Target databases: SQL Server (port 1434) or PostgreSQL (port 5433)
 - Apache Airflow DAGs for orchestration
 - Audit trail and data validation
 - Memory-efficient streaming replication with 128MB buffer
 - Cross-database data type mapping and conversion
+- **Production-like network architecture**: Databases on separate networks, accessed via host IP (simulates AWS RDS, Azure SQL, etc.)
 
 **Stack Overflow Database:**
 - Source: Brent Ozar's StackOverflow2010 database
@@ -297,6 +354,51 @@ docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd -S localhos
 ```
 
 ## Architecture Overview
+
+### Network Design
+
+**Production-Like External Database Access:**
+
+Databases run on **separate Docker networks** from Airflow, accessed via host IP addresses. This simulates real production environments where databases are external services.
+
+```
+┌─────────────────────────────────────────┐
+│  Docker Host (172.17.0.1)              │
+│                                         │
+│  ┌─────────────────────┐                │
+│  │ Astro Network       │                │
+│  │ ┌───────────────┐   │                │
+│  │ │ Airflow       │   │  TCP/IP        │  ┌──────────────┐
+│  │ │ Scheduler     │───┼───────►:1433──┼──│ SQL Server   │
+│  │ └───────────────┘   │    Network     │  │ Source       │
+│  │ ┌───────────────┐   │    Stack       │  └──────────────┘
+│  │ │ Airflow       │   │                │
+│  │ │ Workers       │───┼───────►:5433──┼──┐
+│  │ └───────────────┘   │                │  │
+│  └─────────────────────┘                │  │ ┌──────────────┐
+│                                         │  └─│ PostgreSQL   │
+└─────────────────────────────────────────┘    │ Target       │
+                                               └──────────────┘
+```
+
+**Network Path:**
+1. Airflow containers connect to `172.17.0.1:1433` (Linux) or `host.docker.internal:1433` (macOS/Windows)
+2. Request goes through host network stack (TCP/IP)
+3. Port forwarding maps `host:1433` → `container:1433`
+4. Database container receives connection on its exposed port
+
+**Why This Design?**
+- ✓ **Realistic testing**: Mimics AWS RDS, Azure SQL Database, Google Cloud SQL
+- ✓ **Network isolation**: Databases can't see Airflow infrastructure
+- ✓ **Security validation**: Tests firewall rules and port-based access control
+- ✓ **Performance testing**: Includes real network stack overhead
+- ✓ **Production parity**: Same connection patterns as production deployments
+
+**Alternative (NOT recommended for production-like testing):**
+- Shared Docker network: All containers on same bridge
+- Uses Docker DNS: `stackoverflow-mssql-source:1433`
+- No network isolation or realistic latency
+- Simpler but less representative of production
 
 ### DAG Structure
 
@@ -359,6 +461,68 @@ Users → Badges
 - **Python 3.10+** with pymssql and pg8000 (pure Python drivers)
 - **Docker** for database containerization
 - **pytest** for DAG validation
+
+## Design Decisions
+
+### Why Copy Database Files Instead of Mounting?
+
+The setup instructions **copy** `.mdf` and `.ldf` files into containers rather than mounting them as volumes:
+
+```bash
+# ✓ What we do (copy)
+docker cp StackOverflow2010.mdf stackoverflow-mssql-source:/var/opt/mssql/data/
+
+# ✗ What we DON'T do (mount)
+# docker run -v "$(pwd)/include/stackoverflow:/var/opt/mssql/data" ...
+```
+
+**Reasons:**
+
+1. **File Permission Requirements**
+   - SQL Server requires specific ownership (`mssql:mssql`) and permissions (`660`)
+   - Mounted volumes inherit host filesystem permissions
+   - Container UID/GID (e.g., `mssql` = 10001) may not map to host users
+   - Many filesystems (macOS/Windows) don't support Unix ownership in containers
+
+2. **SQL Server I/O Requirements**
+   - Needs direct I/O, file locking, and specific fsync semantics
+   - Mounted volumes (especially on macOS/Windows) go through VM/network layer
+   - Performance degradation: 10-100x slower on mounted volumes
+   - Risk of corruption if filesystem doesn't honor fsync properly
+
+3. **Cross-Platform Compatibility**
+   - **Copying works consistently** on Linux, macOS, Windows, ChromeOS
+   - **Mounting** has platform-specific issues:
+     - macOS: osxfs/VirtioFS performance penalties
+     - Windows: NTFS → Linux translation issues
+     - ChromeOS: Additional LXD container complexity
+
+4. **Database Upgrade Process**
+   - SQL Server modifies files in-place during version upgrades
+   - Requires full read/write access and ability to extend file size
+   - Our test showed: `Converting database from version 655 to 957`
+   - Mounted volumes may block or corrupt during upgrades
+
+**When to Use Volumes:**
+
+For **production databases** where data persistence is required:
+```bash
+docker run -v sqldata:/var/opt/mssql/data mssql/server:2022-latest
+```
+- Docker-managed volumes use container's native filesystem
+- No host permission mapping issues
+- Data persists across container recreations
+
+**Trade-offs:**
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Copy** (our choice) | Reliable permissions, cross-platform, better performance | Uses 2x disk space, slower initial setup |
+| **Mount** | No duplication, easy host access | Permission issues, platform-specific, potential corruption |
+
+For this **demo/testing scenario** with a read-only source database, copying is the correct choice.
+
+---
 
 ## Troubleshooting
 
