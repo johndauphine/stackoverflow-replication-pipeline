@@ -160,9 +160,11 @@ def create_target_schema() -> None:
             # Add IDENTITY if source column is identity
             if is_identity:
                 col_def += " IDENTITY(1,1)"
-
-            # For BCP, allow NULLs everywhere initially (we'll fix constraints later)
-            col_def += " NULL"
+                # IDENTITY columns must be NOT NULL in SQL Server
+                col_def += " NOT NULL"
+            else:
+                # For BCP, allow NULLs everywhere initially (we'll fix constraints later)
+                col_def += " NULL"
 
             col_defs.append(col_def)
 
@@ -295,6 +297,17 @@ def bcp_import_table(table: str) -> None:
     # Determine file type
     bcp_file = f"{BCP_DIR}/{table}.bcp"
     csv_file = f"{BCP_DIR}/{table}.csv"
+
+    # Debug logging
+    log.info(f"[{table}] Checking for export files...")
+    log.info(f"[{table}] BCP_DIR: {BCP_DIR}")
+    log.info(f"[{table}] Looking for bcp_file: {bcp_file}, exists: {os.path.exists(bcp_file)}")
+    log.info(f"[{table}] Looking for csv_file: {csv_file}, exists: {os.path.exists(csv_file)}")
+
+    if os.path.exists(BCP_DIR):
+        log.info(f"[{table}] BCP_DIR contents: {os.listdir(BCP_DIR)}")
+    else:
+        log.error(f"[{table}] BCP_DIR does not exist!")
 
     if os.path.exists(bcp_file):
         local_file = bcp_file
