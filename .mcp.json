@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mcp-server-docker": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "mcp-server-docker"
+      ],
+      "env": {}
+    }
+  }
+}
