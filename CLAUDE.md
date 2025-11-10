@@ -107,6 +107,8 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ### Step 4: Create Airflow Connections
 
+**IMPORTANT**: Connection host must match your platform. Using the wrong host will cause "Unable to connect" or "Connection refused" errors.
+
 **For Linux (ChromeOS, Ubuntu, etc.):**
 ```bash
 # Source connection (via Docker bridge gateway)
@@ -131,6 +133,15 @@ astro dev run connections add stackoverflow_source \
 astro dev run connections add stackoverflow_target \
   --conn-type mssql --conn-host host.docker.internal --conn-port 1434 \
   --conn-login sa --conn-password "StackOverflow123!" --conn-schema master
+```
+
+**Verification:**
+```bash
+# Verify connections are configured correctly
+astro dev run connections list | grep stackoverflow
+
+# Test connectivity from Airflow
+astro dev run tasks test replicate_stackoverflow_to_target reset_target_schema 2025-11-10
 ```
 
 ### Step 5: Run DAGs
@@ -228,6 +239,8 @@ docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd -S localhos
 
 ### Step 4: Create Airflow Connections
 
+**IMPORTANT**: Connection host must match your platform. Using the wrong host will cause "Unable to connect" or "Connection refused" errors.
+
 **For Linux (ChromeOS, Ubuntu, etc.):**
 ```bash
 # Source connection - SQL Server (via Docker bridge gateway)
@@ -252,6 +265,15 @@ astro dev run connections add stackoverflow_source \
 astro dev run connections add stackoverflow_postgres_target \
   --conn-type postgres --conn-host host.docker.internal --conn-port 5433 \
   --conn-login postgres --conn-password "StackOverflow123!" --conn-schema stackoverflow_target
+```
+
+**Verification:**
+```bash
+# Verify connections are configured correctly
+astro dev run connections list | grep stackoverflow
+
+# Test connectivity from Airflow
+astro dev run tasks test replicate_stackoverflow_to_postgres reset_target_schema 2025-11-10
 ```
 
 ### Step 5: Run DAGs
@@ -525,6 +547,34 @@ For this **demo/testing scenario** with a read-only source database, copying is 
 ---
 
 ## Troubleshooting
+
+**IMPORTANT**: For comprehensive infrastructure troubleshooting (container crashes, authentication issues, connection problems), see [docs/troubleshooting-infrastructure.md](docs/troubleshooting-infrastructure.md).
+
+### Quick Diagnostics
+
+```bash
+# Check all containers are running
+docker ps --filter "name=stackoverflow"
+
+# Test SQL Server connectivity
+docker exec stackoverflow-mssql-source /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P StackOverflow123! -C -Q "SELECT 'Source OK' AS Status;"
+
+docker exec stackoverflow-mssql-target /opt/mssql-tools18/bin/sqlcmd \
+  -S localhost -U sa -P StackOverflow123! -C -Q "SELECT 'Target OK' AS Status;"
+
+# Verify Airflow connections (macOS/Windows should use host.docker.internal)
+astro dev run connections list | grep stackoverflow
+```
+
+### Common Issues Summary
+
+| Issue | Symptom | Quick Fix |
+|-------|---------|-----------|
+| **Container crashes** | Exit code 1, core dumps | Use AMD64 hardware or PostgreSQL |
+| **Auth failures** | "Login failed for user 'sa'" | Wait 45+ seconds after container start |
+| **Connection refused** | "Unable to connect" | Update connections to use `host.docker.internal` (macOS/Windows) or `172.17.0.1` (Linux) |
+| **BCP failures** | "docker: not found" | Use optimized DAG instead |
 
 ### Database File Permissions Issue (SQL Server)
 
