@@ -12,6 +12,7 @@ airflow.db
 
 # Large database files
 *.mdf
+*.ndf
 *.ldf
 *.7z
 *.bak

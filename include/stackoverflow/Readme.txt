@@ -1,9 +1,9 @@
-# Stack Overflow SQL Server Database - Mini 2010 Version
+# Stack Overflow SQL Server Database - Mini 2013 Version
 
 For more information and the latest release:
 http://www.brentozar.com/go/querystack
 
-Imported from the Stack Exchange Data Dump circa 2010
+Imported from the Stack Exchange Data Dump circa 2013
 https://archive.org/details/stackexchange
 
 Imported using the Stack Overflow Data Dump Importer:
