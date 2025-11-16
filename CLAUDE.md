@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - StackOverflow2013 (33GB) - Large-scale validation with 106M+ rows, **18 minutes end-to-end**
 
 **Key Features:**
-- **High-performance streaming** (128MB buffer) - 67% faster than bulk loading on real-world data
+- **High-performance streaming** (256MB buffer) - 67% faster than bulk loading on real-world data
 - Smart parallel execution with dependency-aware task groups
 - Cross-database type mapping (SQL Server ↔ PostgreSQL)
 - Production-like network architecture (Docker DNS resolution)
@@ -210,7 +210,7 @@ The bulk parallel DAG was designed for maximum performance with PostgreSQL optim
 **Trade-off Analysis:**
 - Bulk parallel has sophisticated optimizations (partitioning, UNLOGGED, aggressive memory settings)
 - BUT the overhead of writing/reading 50GB of CSV files more than negates those benefits
-- Streaming's elegant simplicity (128MB memory buffer) beats "clever optimization"
+- Streaming's elegant simplicity (256MB memory buffer) beats "clever optimization"
 
 ### Bulk Parallel DAG (Educational)
 
@@ -388,7 +388,7 @@ Users → Badges
 
 - **Resource Allocation**: Scheduler (2Gi), Webserver (1Gi), Triggerer (512Mi)
 - **Parallelism**: 16 parallel tasks, 8 per DAG, 2 concurrent runs
-- **Memory Streaming**: 128MB buffer, disk spill above threshold
+- **Memory Streaming**: 256MB buffer, disk spill above threshold
 
 ### Design Decisions
 

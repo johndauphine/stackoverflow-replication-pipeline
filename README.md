@@ -8,7 +8,7 @@ This project provides complete, production-quality data replication pipelines us
 
 - **Two replication strategies**: In-memory streaming and bulk file-based parallel loading
 - **SQL Server-to-PostgreSQL** cross-database replication with automatic type mapping
-- **Large-scale dataset handling** (StackOverflow2010: 8.4GB, ~12M rows; tested with StackOverflow2013: 33GB, 70M+ rows)
+- **Large-scale dataset handling** (StackOverflow2010: 8.4GB, ~12M rows; tested with StackOverflow2013: 33GB, 106M+ rows)
 - **Maximum parallel execution** - all tables load simultaneously (no foreign key dependencies during load phase)
 - **Memory-efficient streaming** (256MB buffer with disk spillover)
 - **Bulk file partitioning** for very large tables (500K rows per partition)
@@ -32,14 +32,15 @@ This project includes **two production-ready DAGs** for different use cases:
 - **Tables**: All 9 tables processed in parallel (no foreign key constraints during load)
 
 #### 2. **Bulk Parallel DAG** - `replicate_stackoverflow_to_postgres_bulk_parallel`
-- **Best for**: Very large datasets (millions of rows), maximum parallelism
+- **Best for**: Educational purposes, experimenting with bulk loading patterns
 - **Strategy**: Pre-partitioned CSV files with PostgreSQL COPY command
 - **Approach**: Extracts to CSV files (500K rows per partition), loads in parallel batches
 - **Memory**: Minimal - offloads data to shared volume (`/bulk_files/`)
-- **Speed**: Very fast - PostgreSQL COPY is optimized for bulk loading
+- **Speed**: **Slower than streaming** (67% slower due to CSV file I/O overhead)
 - **Parallelism**: Maximum - loads multiple partitions simultaneously per table
 - **Tables**: Large tables partitioned (Votes, Posts, Comments), small tables loaded whole
 - **Requirements**: Shared volume between Airflow and PostgreSQL containers
+- **Not recommended**: Testing showed streaming DAG is significantly faster
 
 **Quick Comparison:**
 
@@ -63,7 +64,7 @@ This project includes **two production-ready DAGs** for different use cases:
   - Votes: ~4.3M
   - Badges: ~190K
   - PostHistory: ~2.8M
-- **StackOverflow2013** (33GB, 70M+ rows) - Large-scale validation dataset
+- **StackOverflow2013** (33GB, 106M+ rows) - Large-scale validation dataset
 
 ---
 
@@ -185,7 +186,9 @@ docker run -d \
 
 ### 5.4 (Optional) Setup Shared Volume for Bulk DAG
 
-If you plan to use the **bulk parallel DAG**, create a shared volume:
+> **Note**: This setup is only needed for the bulk parallel DAG, which is **not recommended** based on performance testing (67% slower than streaming DAG). Skip this section if using the recommended streaming DAG.
+
+If you plan to use the **bulk parallel DAG** for educational purposes, create a shared volume:
 
 ```bash
 # Create shared directory for bulk files
@@ -304,21 +307,21 @@ You should see:
 
 ### 8.1 Choose Your DAG
 
-**Option 1: Streaming DAG** (Recommended - simpler setup, equivalent performance)
+**Option 1: Streaming DAG** (Recommended - faster and simpler)
 ```bash
 # Enable and trigger streaming DAG
 astro dev run dags unpause replicate_stackoverflow_to_postgres_parallel
 astro dev run dags trigger replicate_stackoverflow_to_postgres_parallel
 ```
 
-**Option 2: Bulk Parallel DAG** (Alternative approach using shared volume)
+**Option 2: Bulk Parallel DAG** (Not recommended - slower, for educational purposes)
 ```bash
 # Enable and trigger bulk parallel DAG
 astro dev run dags unpause replicate_stackoverflow_to_postgres_bulk_parallel
 astro dev run dags trigger replicate_stackoverflow_to_postgres_bulk_parallel
 ```
 
-> **Note**: Both DAGs perform similarly (~3-4 minutes for StackOverflow2010). Streaming DAG is recommended as it's simpler (no shared volume required). Bulk DAG may provide slight advantage on very large datasets (StackOverflow2013: 33GB+).
+> **Note**: **Streaming DAG is 67% faster** based on StackOverflow2013 testing (18m 14s vs 30m 26s for 106M rows). Bulk DAG has CSV file I/O overhead that negates any PostgreSQL COPY optimizations. **Use Streaming DAG for all production workloads.**
 
 ### 8.2 Monitor DAG Execution
 
@@ -341,10 +344,10 @@ Navigate to:
 - **Total pipeline**: **~3-4 minutes** for StackOverflow2010 (tested: 3m 36s)
 
 **Bulk Parallel DAG** (`replicate_stackoverflow_to_postgres_bulk_parallel`):
-- **Extraction + Loading**: **~3-4 minutes** for StackOverflow2010
-- Uses shared volume and PostgreSQL COPY for maximum throughput
+- **Extraction + Loading**: **~3-4 minutes** for StackOverflow2010, **30m 26s** for StackOverflow2013
+- Uses shared volume and PostgreSQL COPY, but **slower than streaming** due to CSV file I/O overhead
 
-> **Note**: Both DAGs perform similarly due to full parallelism. Streaming DAG is simpler to set up (no shared volume required). Bulk DAG may have slight advantage on very large datasets (StackOverflow2013: 33GB, 70M+ rows) due to PostgreSQL COPY optimizations.
+> **Note**: **Streaming DAG is significantly faster** (67% faster on large datasets). The CSV file I/O overhead in the bulk DAG (writing/reading 50GB+ of files) negates any PostgreSQL COPY optimizations. Testing on StackOverflow2013 (106M rows) proved streaming is the superior approach.
 
 ---
 
@@ -448,8 +451,9 @@ Reset Schema → Create Schema → [All 9 Tables in Parallel] → Convert to Log
 - Large tables automatically partitioned (Votes, Posts, Comments)
 - Small tables loaded whole (VoteTypes, PostTypes, LinkTypes, etc.)
 - No foreign key constraints during load phase
-- PostgreSQL COPY command for ultra-fast bulk loading
+- PostgreSQL COPY command for bulk loading
 - Foreign keys and indexes added after all data is loaded
+- **Note**: Despite optimizations, CSV file I/O overhead makes this approach 67% slower than streaming
 
 **Data Flow**:
 ```
@@ -468,7 +472,7 @@ Reset → Create Schema → Optimize PostgreSQL → [All 9 Tables in Parallel] �
 - **Users, Badges, PostLinks**: No partitioning (< 500K rows each)
 - **VoteTypes, PostTypes, LinkTypes**: No partitioning (< 100 rows each)
 
-> **Note**: For StackOverflow2013, partition counts scale proportionally: Votes (~80 partitions), Posts (~20 partitions), Comments (~14 partitions)
+> **Note**: For StackOverflow2013 (106M rows), partition counts scale proportionally: Votes (~106 partitions), Posts (~34 partitions), Comments (~49 partitions). However, the CSV file I/O overhead makes this slower than streaming despite the parallelism.
 
 ### 10.3 Cross-Database Type Mapping
 
