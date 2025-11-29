@@ -170,9 +170,10 @@ def create_or_truncate_tables() -> None:
         table_exists = tgt_cur.fetchone() is not None
 
         if table_exists:
-            # Table exists - truncate and reset identity
+            # Table exists - set UNLOGGED for fast bulk loading, then truncate and reset identity
+            tgt_cur.execute(f'ALTER TABLE "{table}" SET UNLOGGED')
             tgt_cur.execute(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE')
-            log.info(f"Truncated existing table {table}")
+            log.info(f"Set table {table} to UNLOGGED and truncated it")
         else:
             # Table doesn't exist - create it
             log.info(f"Creating table schema for {table}")
