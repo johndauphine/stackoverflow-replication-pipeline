@@ -172,7 +172,10 @@ def create_or_truncate_tables() -> None:
         table_exists = tgt_cur.fetchone() is not None
 
         if table_exists:
-            # Check if table is already UNLOGGED (avoid redundant ALTER)
+            # Truncate first (fast on any table)
+            tgt_cur.execute(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE')
+
+            # Then set UNLOGGED (fast on empty table, slow on populated table)
             tgt_cur.execute("""
                 SELECT relpersistence FROM pg_class
                 WHERE relname = %s AND relkind = 'r'
@@ -181,10 +184,9 @@ def create_or_truncate_tables() -> None:
 
             if persistence != 'u':  # 'u' = unlogged, 'p' = permanent (logged)
                 tgt_cur.execute(f'ALTER TABLE "{table}" SET UNLOGGED')
-                log.info(f"Converted {table} to UNLOGGED for bulk loading")
-
-            tgt_cur.execute(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE')
-            log.info(f"Truncated {table}")
+                log.info(f"Truncated {table} and set to UNLOGGED")
+            else:
+                log.info(f"Truncated {table} (already UNLOGGED)")
         else:
             # Table doesn't exist - create it
             log.info(f"Creating table schema for {table}")
