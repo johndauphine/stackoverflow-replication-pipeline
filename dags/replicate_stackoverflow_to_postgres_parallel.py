@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 from datetime import datetime, timedelta
 from tempfile import SpooledTemporaryFile
 
 from airflow import DAG
+from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.providers.microsoft.mssql.hooks.mssql import MsSqlHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -445,12 +447,49 @@ def copy_table_src_to_tgt(table: str) -> None:
             tgt_conn.close()
 
 
+def get_source_row_count(table: str) -> int:
+    """Get current row count from source table."""
+    src_hook = MsSqlHook(mssql_conn_id=SRC_CONN_ID)
+    with src_hook.get_conn() as conn:
+        conn.autocommit(True)
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM dbo.[{table}]")
+            return cur.fetchone()[0]
+
+
 def get_partition_ranges(table: str, num_partitions: int) -> list[tuple[int, int]]:
     """
     Get ID ranges for partitioning a table by row count (not ID range).
     Uses NTILE to divide actual rows evenly.
     Returns list of (min_id, max_id) tuples for each partition.
+
+    Caches ranges in Airflow Variables to avoid expensive NTILE queries
+    on subsequent runs when data hasn't changed significantly.
     """
+    cache_key = f"partition_ranges_{table}"
+
+    # Check cache first
+    try:
+        cached_json = Variable.get(cache_key, default_var=None)
+        if cached_json:
+            cached = json.loads(cached_json)
+            if cached.get("num_partitions") == num_partitions:
+                # Quick row count check (much faster than NTILE)
+                current_count = get_source_row_count(table)
+                cached_count = cached.get("row_count", 0)
+                # Allow 1% variance before recalculating
+                if abs(current_count - cached_count) < max(1000, cached_count * 0.01):
+                    log.info(f"[{table}] Using cached partition ranges (row_count: {cached_count}, current: {current_count})")
+                    ranges = [tuple(r) for r in cached["ranges"]]
+                    for i, (min_id, max_id) in enumerate(ranges):
+                        log.info(f"[{table}] Partition {i}: Id [{min_id}, {max_id}] (cached)")
+                    return ranges
+                else:
+                    log.info(f"[{table}] Row count changed ({cached_count} → {current_count}), recalculating partitions")
+    except Exception as e:
+        log.warning(f"[{table}] Cache read failed: {e}, calculating fresh partitions")
+
+    # Calculate fresh ranges with NTILE
     src_hook = MsSqlHook(mssql_conn_id=SRC_CONN_ID)
 
     with src_hook.get_conn() as conn:
@@ -469,12 +508,27 @@ def get_partition_ranges(table: str, num_partitions: int) -> list[tuple[int, int
             """)
 
             ranges = []
+            total_rows = 0
             for row in cur.fetchall():
                 partition_num, min_id, max_id, row_count = row
                 ranges.append((min_id, max_id))
+                total_rows += row_count
                 log.info(f"[{table}] Partition {partition_num-1}: Id [{min_id}, {max_id}] = {row_count} rows")
 
     log.info(f"[{table}] Partitioned into {num_partitions} ranges by row count")
+
+    # Cache for next run
+    try:
+        cache_data = {
+            "ranges": ranges,
+            "row_count": total_rows,
+            "num_partitions": num_partitions,
+        }
+        Variable.set(cache_key, json.dumps(cache_data))
+        log.info(f"[{table}] Cached partition ranges for future runs")
+    except Exception as e:
+        log.warning(f"[{table}] Failed to cache partition ranges: {e}")
+
     return ranges
 
 
@@ -612,8 +666,6 @@ def prepare_partitioned_table(table: str) -> None:
 
 def copy_table_partition_from_xcom(table: str, partition_num: int, ranges) -> dict:
     """Wrapper to extract range from XCom and call copy_table_partition."""
-    import json
-
     # Handle string (from Jinja templating without render_template_as_native_obj)
     if isinstance(ranges, str):
         ranges = json.loads(ranges)
