@@ -23,16 +23,16 @@ REGULAR_TABLES = [
     "VoteTypes",      # Small lookup table
     "PostTypes",      # Small lookup table
     "LinkTypes",      # Small lookup table
-    "Users",          # 299K rows
-    "Badges",         # 1.1M rows
-    "PostLinks",      # ~100K rows
-    "Comments",       # ~3.9M rows
-    "Votes",          # ~10M rows
+    "Users",          # 2.5M rows (2013)
+    "Badges",         # 8M rows (2013)
+    "PostLinks",      # ~546K rows (2013)
 ]
 
 # Large tables to partition for parallel loading
 PARTITIONED_TABLES = {
-    "Posts": 4,       # 3.7M rows - split into 4 parallel chunks
+    "Posts": 4,       # 17M rows (2013) - split into 4 parallel chunks
+    "Comments": 4,    # 24.5M rows (2013) - split into 4 parallel chunks
+    "Votes": 4,       # 52.9M rows (2013) - split into 4 parallel chunks
 }
 
 # All tables (for schema creation)
