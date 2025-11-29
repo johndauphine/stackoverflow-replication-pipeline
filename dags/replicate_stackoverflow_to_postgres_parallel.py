@@ -13,8 +13,8 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 SRC_CONN_ID = "stackoverflow_source"
 TGT_CONN_ID = "stackoverflow_postgres_target"
 
-# Increased memory buffer for better performance (1GB)
-SPOOLED_MAX_MEMORY_BYTES = 1024 * 1024 * 1024  # spill to disk above ~1 GB
+# Memory buffer - 256MB is sufficient since large tables are partitioned
+SPOOLED_MAX_MEMORY_BYTES = 256 * 1024 * 1024  # spill to disk above ~256 MB
 
 log = logging.getLogger(__name__)
 
