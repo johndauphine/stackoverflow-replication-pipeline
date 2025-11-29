@@ -26,13 +26,13 @@ REGULAR_TABLES = [
     "Users",          # 299K rows
     "Badges",         # 1.1M rows
     "PostLinks",      # ~100K rows
-    "Comments",       # ~3.9M rows
-    "Votes",          # ~10M rows
 ]
 
 # Large tables to partition for parallel loading
 PARTITIONED_TABLES = {
     "Posts": 4,       # 3.7M rows - split into 4 parallel chunks
+    "Votes": 4,       # 10.1M rows - split into 4 parallel chunks
+    "Comments": 4,    # 3.9M rows - split into 4 parallel chunks
 }
 
 # All tables (for schema creation)
