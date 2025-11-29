@@ -13,23 +13,30 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 SRC_CONN_ID = "stackoverflow_source"
 TGT_CONN_ID = "stackoverflow_postgres_target"
 
-# Increased memory buffer for better performance (256MB)
-SPOOLED_MAX_MEMORY_BYTES = 256 * 1024 * 1024  # spill to disk above ~256 MB
+# Increased memory buffer for better performance (1GB)
+SPOOLED_MAX_MEMORY_BYTES = 1024 * 1024 * 1024  # spill to disk above ~1 GB
 
 log = logging.getLogger(__name__)
 
-# ALL tables - no dependencies since no foreign keys!
-ALL_TABLES = [
+# Tables to copy without partitioning
+REGULAR_TABLES = [
     "VoteTypes",      # Small lookup table
     "PostTypes",      # Small lookup table
     "LinkTypes",      # Small lookup table
     "Users",          # 299K rows
     "Badges",         # 1.1M rows
-    "Posts",          # 3.7M rows (largest)
     "PostLinks",      # ~100K rows
-    "Comments",       # ~1.3M rows
-    "Votes",          # ~10M rows (might be largest)
+    "Comments",       # ~3.9M rows
+    "Votes",          # ~10M rows
 ]
+
+# Large tables to partition for parallel loading
+PARTITIONED_TABLES = {
+    "Posts": 4,       # 3.7M rows - split into 4 parallel chunks
+}
+
+# All tables (for schema creation)
+ALL_TABLES = REGULAR_TABLES + list(PARTITIONED_TABLES.keys())
 
 DEFAULT_ARGS = {
     "retries": 2,
@@ -438,6 +445,214 @@ def copy_table_src_to_tgt(table: str) -> None:
             tgt_conn.close()
 
 
+def get_partition_ranges(table: str, num_partitions: int) -> list[tuple[int, int]]:
+    """
+    Get ID ranges for partitioning a table by row count (not ID range).
+    Uses NTILE to divide actual rows evenly.
+    Returns list of (min_id, max_id) tuples for each partition.
+    """
+    src_hook = MsSqlHook(mssql_conn_id=SRC_CONN_ID)
+
+    with src_hook.get_conn() as conn:
+        conn.autocommit(True)
+        with conn.cursor() as cur:
+            # Use NTILE to divide rows evenly and get boundary IDs
+            cur.execute(f"""
+                WITH Partitioned AS (
+                    SELECT Id, NTILE({num_partitions}) OVER (ORDER BY Id) as partition_num
+                    FROM dbo.[{table}]
+                )
+                SELECT partition_num, MIN(Id) as min_id, MAX(Id) as max_id, COUNT(*) as row_count
+                FROM Partitioned
+                GROUP BY partition_num
+                ORDER BY partition_num
+            """)
+
+            ranges = []
+            for row in cur.fetchall():
+                partition_num, min_id, max_id, row_count = row
+                ranges.append((min_id, max_id))
+                log.info(f"[{table}] Partition {partition_num-1}: Id [{min_id}, {max_id}] = {row_count} rows")
+
+    log.info(f"[{table}] Partitioned into {num_partitions} ranges by row count")
+    return ranges
+
+
+def copy_table_partition(table: str, partition_num: int, min_id: int | str, max_id: int | str) -> dict:
+    """
+    Copy a partition of a table from SQL Server to PostgreSQL.
+    Uses WHERE Id BETWEEN min_id AND max_id for the partition.
+    Returns stats dict with row count and duration.
+    """
+    import time
+    start_time = time.time()
+
+    # Convert string IDs to int (from Jinja templating)
+    min_id = int(min_id)
+    max_id = int(max_id)
+
+    src_hook = MsSqlHook(mssql_conn_id=SRC_CONN_ID)
+    tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID, schema='stackoverflow_target')
+
+    log.info(
+        "[%s] partition %d: copying Id range [%d, %d]",
+        table, partition_num, min_id, max_id,
+    )
+
+    # Get target table columns
+    with tgt_hook.get_conn() as tgt_conn_tmp:
+        tgt_conn_tmp.autocommit = True
+        with tgt_conn_tmp.cursor() as tgt_cur_tmp:
+            tgt_cur_tmp.execute(
+                """
+                SELECT c.column_name, c.is_nullable, ident.is_identity
+                FROM information_schema.columns c
+                LEFT JOIN (
+                    SELECT column_name, 'YES' as is_identity
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = %s
+                      AND column_default LIKE 'nextval%%'
+                ) ident ON c.column_name = ident.column_name
+                WHERE c.table_schema = 'public'
+                  AND c.table_name = %s
+                ORDER BY c.ordinal_position
+                """,
+                (table, table),
+            )
+            column_info = tgt_cur_tmp.fetchall()
+            target_columns = [row[0] for row in column_info]
+            identity_columns = {row[0] for row in column_info if row[2] == 'YES'}
+
+    column_list_for_select = ", ".join(f"[{col}]" for col in target_columns)
+
+    # Use text mode for CSV writing
+    with SpooledTemporaryFile(
+        max_size=SPOOLED_MAX_MEMORY_BYTES, mode="w+", encoding='utf-8', newline=''
+    ) as spool:
+        csv_writer = csv.writer(spool)
+
+        # Read partition from source SQL Server
+        with src_hook.get_conn() as src_conn:
+            src_conn.autocommit(True)
+            with src_conn.cursor() as src_cur:
+                # Select partition by ID range
+                src_cur.execute(
+                    f"SELECT {column_list_for_select} FROM dbo.[{table}] WHERE Id BETWEEN %s AND %s",
+                    (min_id, max_id)
+                )
+
+                row_count_src = 0
+                for row in src_cur:
+                    csv_row = []
+                    for v in row:
+                        if v is None:
+                            csv_row.append('')
+                        elif isinstance(v, datetime):
+                            csv_row.append(v.strftime('%Y-%m-%d %H:%M:%S'))
+                        elif isinstance(v, bool):
+                            csv_row.append('t' if v else 'f')
+                        else:
+                            csv_row.append(str(v))
+                    csv_writer.writerow(csv_row)
+                    row_count_src += 1
+
+        spool.flush()
+        written_bytes = spool.tell()
+        spool.seek(0)
+
+        # Write to PostgreSQL target using COPY command
+        tgt_conn = tgt_hook.get_conn()
+        tgt_conn.autocommit = False
+        tgt_cur = tgt_conn.cursor()
+
+        try:
+            column_list = ", ".join(f'"{col}"' for col in target_columns)
+            copy_sql = f'COPY "{table}" ({column_list}) FROM STDIN WITH (FORMAT CSV, NULL \'\')'
+            tgt_cur.copy_expert(copy_sql, spool)
+            tgt_conn.commit()
+
+            duration = time.time() - start_time
+            log.info(
+                "[%s] partition %d completed: %d rows, %.1f MB, %.1f sec",
+                table, partition_num, row_count_src, written_bytes / (1024*1024), duration
+            )
+            return {"rows": row_count_src, "bytes": written_bytes, "duration": duration}
+        except Exception as e:
+            tgt_conn.rollback()
+            log.error(f"[{table}] partition {partition_num} failed: {e}")
+            raise
+        finally:
+            tgt_cur.close()
+            tgt_conn.close()
+
+
+def prepare_partitioned_table(table: str) -> None:
+    """
+    Prepare a partitioned table for loading by dropping identity constraint.
+    Must be called before partition tasks run.
+    """
+    tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID, schema='stackoverflow_target')
+
+    with tgt_hook.get_conn() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # Delete any existing rows
+            cur.execute(f'DELETE FROM "{table}"')
+
+            # Disable triggers and autovacuum
+            cur.execute(f'ALTER TABLE "{table}" DISABLE TRIGGER ALL')
+            cur.execute(f'ALTER TABLE "{table}" SET (autovacuum_enabled = false)')
+
+            # Drop identity to allow manual ID insertion
+            cur.execute(f'ALTER TABLE "{table}" ALTER COLUMN "Id" DROP IDENTITY IF EXISTS')
+
+            log.info(f"[{table}] Prepared for partitioned loading")
+
+
+def copy_table_partition_from_xcom(table: str, partition_num: int, ranges) -> dict:
+    """Wrapper to extract range from XCom and call copy_table_partition."""
+    import json
+
+    # Handle string (from Jinja templating without render_template_as_native_obj)
+    if isinstance(ranges, str):
+        ranges = json.loads(ranges)
+
+    range_item = ranges[partition_num]
+    # Handle both tuple and XCom serialization formats
+    if isinstance(range_item, dict) and "__data__" in range_item:
+        min_id, max_id = range_item["__data__"]
+    elif isinstance(range_item, (list, tuple)):
+        min_id, max_id = range_item
+    else:
+        raise ValueError(f"Unexpected range format: {range_item}")
+    return copy_table_partition(table, partition_num, min_id, max_id)
+
+
+def finalize_partitioned_table(table: str) -> None:
+    """
+    Finalize a partitioned table after all partitions loaded.
+    Re-adds identity constraint and re-enables triggers.
+    """
+    tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID, schema='stackoverflow_target')
+
+    with tgt_hook.get_conn() as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            # Re-add identity
+            cur.execute(f'ALTER TABLE "{table}" ALTER COLUMN "Id" ADD GENERATED ALWAYS AS IDENTITY')
+
+            # Re-enable triggers and autovacuum
+            cur.execute(f'ALTER TABLE "{table}" ENABLE TRIGGER ALL')
+            cur.execute(f'ALTER TABLE "{table}" SET (autovacuum_enabled = true)')
+
+            # Get row count
+            cur.execute(f'SELECT COUNT(*) FROM "{table}"')
+            row_count = cur.fetchone()[0]
+
+            log.info(f"[{table}] Finalized partitioned load: {row_count} total rows")
+
+
 def convert_tables_to_logged() -> None:
     """Convert all UNLOGGED tables to regular logged tables for durability."""
     tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID, schema='stackoverflow_target')
@@ -520,9 +735,10 @@ with DAG(
     schedule=None,
     catchup=False,
     default_args=DEFAULT_ARGS,
-    tags=["stackoverflow", "postgres", "replication", "full-parallel", "optimized"],
+    tags=["stackoverflow", "postgres", "replication", "full-parallel", "optimized", "partitioned"],
     template_searchpath=["/usr/local/airflow/include"],
-    description="FULL PARALLEL: All tables load simultaneously (no FK dependencies) with PostgreSQL optimizations",
+    description="FULL PARALLEL with PARTITIONED large tables: Posts split into 4 parallel chunks",
+    render_template_as_native_obj=True,  # Parse XCom as native Python objects
 ) as dag:
     reset_tgt = PythonOperator(
         task_id="reset_target_schema",
@@ -534,15 +750,59 @@ with DAG(
         python_callable=create_target_schema,
     )
 
-    # ALL tables run in parallel!
-    copy_tasks = [
+    # Regular tables run in parallel
+    copy_regular_tasks = [
         PythonOperator(
             task_id=f"copy_{tbl}",
             python_callable=copy_table_src_to_tgt,
             op_kwargs={"table": tbl},
         )
-        for tbl in ALL_TABLES
+        for tbl in REGULAR_TABLES
     ]
+
+    # Partitioned tables: prepare → parallel partitions → finalize
+    partitioned_tasks = []
+
+    for table, num_partitions in PARTITIONED_TABLES.items():
+        # Get partition ranges at DAG parse time (will be recalculated at runtime)
+        # We create fixed partition tasks based on num_partitions
+
+        prepare_task = PythonOperator(
+            task_id=f"prepare_{table}",
+            python_callable=prepare_partitioned_table,
+            op_kwargs={"table": table},
+        )
+
+        # Create partition copy tasks
+        partition_tasks = []
+        for i in range(num_partitions):
+            partition_task = PythonOperator(
+                task_id=f"copy_{table}_p{i}",
+                python_callable=copy_table_partition_from_xcom,
+                op_kwargs={
+                    "table": table,
+                    "partition_num": i,
+                    "ranges": "{{ ti.xcom_pull(task_ids='get_" + table + "_ranges') }}",
+                },
+            )
+            partition_tasks.append(partition_task)
+
+        finalize_task = PythonOperator(
+            task_id=f"finalize_{table}",
+            python_callable=finalize_partitioned_table,
+            op_kwargs={"table": table},
+        )
+
+        # Get ranges task
+        get_ranges_task = PythonOperator(
+            task_id=f"get_{table}_ranges",
+            python_callable=get_partition_ranges,
+            op_kwargs={"table": table, "num_partitions": num_partitions},
+        )
+
+        # Dependencies: create_schema → get_ranges → prepare → partitions (parallel) → finalize
+        create_schema >> get_ranges_task >> prepare_task >> partition_tasks >> finalize_task
+        partitioned_tasks.append(finalize_task)
 
     convert_to_logged = PythonOperator(
         task_id="convert_tables_to_logged",
@@ -554,6 +814,11 @@ with DAG(
         python_callable=set_identity_sequences,
     )
 
-    # FULLY PARALLEL DEPENDENCY GRAPH
-    # Schema creation → ALL tables in parallel → convert → fix sequences
-    reset_tgt >> create_schema >> copy_tasks >> convert_to_logged >> fix_sequences
+    # DEPENDENCY GRAPH:
+    # reset → create_schema → [regular tables in parallel] → convert → fix_sequences
+    #                       → [partitioned: get_ranges → prepare → partitions → finalize] →
+    reset_tgt >> create_schema >> copy_regular_tasks >> convert_to_logged >> fix_sequences
+
+    # Partitioned tables also flow into convert_to_logged
+    for task in partitioned_tasks:
+        task >> convert_to_logged
