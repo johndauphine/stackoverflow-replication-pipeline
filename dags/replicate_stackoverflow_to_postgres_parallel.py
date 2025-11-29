@@ -44,11 +44,10 @@ DEFAULT_ARGS = {
 }
 
 
-def reset_target_schema() -> None:
-    """Create stackoverflow_target database and drop all tables on PostgreSQL target."""
+def ensure_target_database() -> None:
+    """Ensure stackoverflow_target database exists (creates if needed, does not drop)."""
     hook = PostgresHook(postgres_conn_id=TGT_CONN_ID)
 
-    # First, connect to default database to create stackoverflow_target if needed
     conn = hook.get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -59,54 +58,10 @@ def reset_target_schema() -> None:
     """)
 
     if cur.fetchone() is None:
-        # Create database
         cur.execute("CREATE DATABASE stackoverflow_target")
         log.info("Created stackoverflow_target database")
     else:
         log.info("stackoverflow_target database already exists")
-
-    cur.close()
-    conn.close()
-
-    # Now connect to stackoverflow_target to drop tables
-    hook_target = PostgresHook(postgres_conn_id=TGT_CONN_ID, schema='stackoverflow_target')
-    conn = hook_target.get_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    # Drop all foreign key constraints first
-    cur.execute("""
-        DO $$
-        DECLARE
-            r RECORD;
-        BEGIN
-            FOR r IN (
-                SELECT constraint_name, table_name
-                FROM information_schema.table_constraints
-                WHERE constraint_type = 'FOREIGN KEY'
-                  AND table_schema = 'public'
-            ) LOOP
-                EXECUTE 'ALTER TABLE ' || quote_ident(r.table_name) || ' DROP CONSTRAINT ' || quote_ident(r.constraint_name);
-            END LOOP;
-        END $$;
-    """)
-
-    # Drop all tables in public schema
-    cur.execute("""
-        DO $$
-        DECLARE
-            r RECORD;
-        BEGIN
-            FOR r IN (
-                SELECT tablename
-                FROM pg_tables
-                WHERE schemaname = 'public'
-            ) LOOP
-                EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
-            END LOOP;
-        END $$;
-    """)
-    log.info("Dropped all existing tables in public schema")
 
     cur.close()
     conn.close()
@@ -185,11 +140,11 @@ def map_sqlserver_to_postgres_type(data_type: str, char_len: int | None, num_pre
         return "TEXT"
 
 
-def create_target_schema() -> None:
+def create_or_truncate_tables() -> None:
     """
-    Dynamically create target schema by copying table structures from SQL Server source.
+    Create tables if they don't exist, or truncate if they do.
     Converts SQL Server data types to PostgreSQL equivalents.
-    Creates tables as UNLOGGED for faster bulk loading (will be converted to logged after load).
+    Creates new tables as UNLOGGED for faster bulk loading.
     """
     src_hook = MsSqlHook(mssql_conn_id=SRC_CONN_ID)
     tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID, schema='stackoverflow_target')
@@ -206,82 +161,104 @@ def create_target_schema() -> None:
     tgt_cur.execute("SET maintenance_work_mem = '256MB'")
     log.info("Configured PostgreSQL for bulk loading (maintenance_work_mem=256MB)")
 
-    # For each table, get CREATE TABLE script from source
     for table in ALL_TABLES:
-        log.info(f"Creating table schema for {table}")
-
-        # Get column definitions from source
-        src_cur.execute("""
-            SELECT
-                c.COLUMN_NAME,
-                c.DATA_TYPE,
-                c.CHARACTER_MAXIMUM_LENGTH,
-                c.NUMERIC_PRECISION,
-                c.NUMERIC_SCALE,
-                c.IS_NULLABLE,
-                COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY
-            FROM INFORMATION_SCHEMA.COLUMNS c
-            WHERE c.TABLE_NAME = %s
-            ORDER BY c.ORDINAL_POSITION
+        # Check if table exists
+        tgt_cur.execute("""
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = %s
         """, (table,))
+        table_exists = tgt_cur.fetchone() is not None
 
-        columns = src_cur.fetchall()
+        if table_exists:
+            # Check if table is already UNLOGGED (avoid redundant ALTER)
+            tgt_cur.execute("""
+                SELECT relpersistence FROM pg_class
+                WHERE relname = %s AND relkind = 'r'
+            """, (table,))
+            persistence = tgt_cur.fetchone()[0]
 
-        if not columns:
-            log.warning(f"Table {table} not found in source database, skipping")
-            continue
+            if persistence != 'u':  # 'u' = unlogged, 'p' = permanent (logged)
+                tgt_cur.execute(f'ALTER TABLE "{table}" SET UNLOGGED')
+                log.info(f"Converted {table} to UNLOGGED for bulk loading")
 
-        # Build CREATE TABLE statement
-        col_defs = []
-        for col in columns:
-            col_name, data_type, char_len, num_prec, num_scale, is_nullable, is_identity = col
+            tgt_cur.execute(f'TRUNCATE TABLE "{table}" RESTART IDENTITY CASCADE')
+            log.info(f"Truncated {table}")
+        else:
+            # Table doesn't exist - create it
+            log.info(f"Creating table schema for {table}")
 
-            # Map SQL Server type to PostgreSQL type
-            pg_type = map_sqlserver_to_postgres_type(data_type, char_len, num_prec, num_scale)
+            # Get column definitions from source
+            src_cur.execute("""
+                SELECT
+                    c.COLUMN_NAME,
+                    c.DATA_TYPE,
+                    c.CHARACTER_MAXIMUM_LENGTH,
+                    c.NUMERIC_PRECISION,
+                    c.NUMERIC_SCALE,
+                    c.IS_NULLABLE,
+                    COLUMNPROPERTY(OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME), c.COLUMN_NAME, 'IsIdentity') AS IS_IDENTITY
+                FROM INFORMATION_SCHEMA.COLUMNS c
+                WHERE c.TABLE_NAME = %s
+                ORDER BY c.ORDINAL_POSITION
+            """, (table,))
 
-            # Build column definition
-            col_def = f'"{col_name}" {pg_type}'
+            columns = src_cur.fetchall()
 
-            # Add GENERATED AS IDENTITY if source column is identity
-            if is_identity:
-                col_def += " GENERATED ALWAYS AS IDENTITY"
+            if not columns:
+                log.warning(f"Table {table} not found in source database, skipping")
+                continue
 
-            # Add NULL/NOT NULL
-            # Special case: Allow NULL for text columns even if source says NOT NULL
-            # to handle empty strings that get converted to NULL during CSV export
-            if is_nullable == 'NO' and pg_type not in ('TEXT', 'VARCHAR') and not pg_type.startswith('VARCHAR('):
-                col_def += " NOT NULL"
-            else:
-                col_def += " NULL"
+            # Build CREATE TABLE statement
+            col_defs = []
+            for col in columns:
+                col_name, data_type, char_len, num_prec, num_scale, is_nullable, is_identity = col
 
-            col_defs.append(col_def)
+                # Map SQL Server type to PostgreSQL type
+                pg_type = map_sqlserver_to_postgres_type(data_type, char_len, num_prec, num_scale)
 
-        # Get primary key
-        src_cur.execute("""
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-            WHERE TABLE_NAME = %s
-              AND CONSTRAINT_NAME LIKE 'PK_%'
-            ORDER BY ORDINAL_POSITION
-        """, (table,))
+                # Build column definition
+                col_def = f'"{col_name}" {pg_type}'
 
-        pk_cols = [row[0] for row in src_cur.fetchall()]
+                # Add GENERATED AS IDENTITY if source column is identity
+                if is_identity:
+                    col_def += " GENERATED ALWAYS AS IDENTITY"
 
-        if pk_cols:
-            pk_def = f"PRIMARY KEY ({', '.join(f'"{col}"' for col in pk_cols)})"
-            col_defs.append(pk_def)
+                # Add NULL/NOT NULL
+                # Special case: Allow NULL for text columns even if source says NOT NULL
+                # to handle empty strings that get converted to NULL during CSV export
+                if is_nullable == 'NO' and pg_type not in ('TEXT', 'VARCHAR') and not pg_type.startswith('VARCHAR('):
+                    col_def += " NOT NULL"
+                else:
+                    col_def += " NULL"
 
-        # Create UNLOGGED table for faster bulk loading (skips WAL)
-        create_sql = f'CREATE UNLOGGED TABLE "{table}" (\n  {",\n  ".join(col_defs)}\n);'
-        tgt_cur.execute(create_sql)
-        log.info(f"Created UNLOGGED table {table} (no WAL overhead)")
+                col_defs.append(col_def)
+
+            # Get primary key
+            src_cur.execute("""
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                WHERE TABLE_NAME = %s
+                  AND CONSTRAINT_NAME LIKE 'PK_%'
+                ORDER BY ORDINAL_POSITION
+            """, (table,))
+
+            pk_cols = [row[0] for row in src_cur.fetchall()]
+
+            if pk_cols:
+                pk_def = f"PRIMARY KEY ({', '.join(f'"{col}"' for col in pk_cols)})"
+                col_defs.append(pk_def)
+
+            # Create UNLOGGED table for faster bulk loading (skips WAL)
+            create_sql = f'CREATE UNLOGGED TABLE "{table}" (\n  {",\n  ".join(col_defs)}\n);'
+            tgt_cur.execute(create_sql)
+            log.info(f"Created UNLOGGED table {table} (no WAL overhead)")
 
     src_cur.close()
     src_conn.close()
     tgt_cur.close()
     tgt_conn.close()
 
-    log.info("Target schema created successfully (UNLOGGED tables for bulk load)")
+    log.info("Table setup completed (created missing tables, truncated existing)")
 
 
 def copy_table_src_to_tgt(table: str) -> None:
@@ -396,8 +373,7 @@ def copy_table_src_to_tgt(table: str) -> None:
                     f"Target table {table} does not exist; did schema creation run?"
                 )
 
-            # Delete all rows from target table
-            tgt_cur.execute(f'DELETE FROM "{table}"')
+            # Table was already truncated in create_or_truncate_tables
 
             # Disable triggers and autovacuum for this table
             tgt_cur.execute(f'ALTER TABLE "{table}" DISABLE TRIGGER ALL')
@@ -591,14 +567,14 @@ def prepare_partitioned_table(table: str) -> None:
     """
     Prepare a partitioned table for loading by dropping identity constraint.
     Must be called before partition tasks run.
+    Table was already truncated in create_or_truncate_tables.
     """
     tgt_hook = PostgresHook(postgres_conn_id=TGT_CONN_ID, schema='stackoverflow_target')
 
     with tgt_hook.get_conn() as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
-            # Delete any existing rows
-            cur.execute(f'DELETE FROM "{table}"')
+            # Table was already truncated in create_or_truncate_tables
 
             # Disable triggers and autovacuum
             cur.execute(f'ALTER TABLE "{table}" DISABLE TRIGGER ALL')
@@ -740,14 +716,14 @@ with DAG(
     description="FULL PARALLEL with PARTITIONED large tables: Posts split into 4 parallel chunks",
     render_template_as_native_obj=True,  # Parse XCom as native Python objects
 ) as dag:
-    reset_tgt = PythonOperator(
-        task_id="reset_target_schema",
-        python_callable=reset_target_schema,
+    ensure_db = PythonOperator(
+        task_id="ensure_target_database",
+        python_callable=ensure_target_database,
     )
 
-    create_schema = PythonOperator(
-        task_id="create_target_schema",
-        python_callable=create_target_schema,
+    setup_tables = PythonOperator(
+        task_id="create_or_truncate_tables",
+        python_callable=create_or_truncate_tables,
     )
 
     # Regular tables run in parallel
@@ -800,8 +776,8 @@ with DAG(
             op_kwargs={"table": table, "num_partitions": num_partitions},
         )
 
-        # Dependencies: create_schema → get_ranges → prepare → partitions (parallel) → finalize
-        create_schema >> get_ranges_task >> prepare_task >> partition_tasks >> finalize_task
+        # Dependencies: setup_tables → get_ranges → prepare → partitions (parallel) → finalize
+        setup_tables >> get_ranges_task >> prepare_task >> partition_tasks >> finalize_task
         partitioned_tasks.append(finalize_task)
 
     convert_to_logged = PythonOperator(
@@ -815,9 +791,9 @@ with DAG(
     )
 
     # DEPENDENCY GRAPH:
-    # reset → create_schema → [regular tables in parallel] → convert → fix_sequences
-    #                       → [partitioned: get_ranges → prepare → partitions → finalize] →
-    reset_tgt >> create_schema >> copy_regular_tasks >> convert_to_logged >> fix_sequences
+    # ensure_db → setup_tables → [regular tables in parallel] → convert → fix_sequences
+    #                          → [partitioned: get_ranges → prepare → partitions → finalize] →
+    ensure_db >> setup_tables >> copy_regular_tasks >> convert_to_logged >> fix_sequences
 
     # Partitioned tables also flow into convert_to_logged
     for task in partitioned_tasks:
